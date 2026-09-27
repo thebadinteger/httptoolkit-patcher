@@ -1,0 +1,419 @@
+// @ts-check
+import { spawn } from 'child_process'
+import { flipFuses, FuseVersion, FuseV1Options } from '@electron/fuses'
+import asar from '@electron/asar'
+import prompts from 'prompts'
+import yargs from 'yargs'
+import chalk from 'chalk'
+import path from 'path'
+import fs from 'fs'
+import os from 'os'
+
+const argv = await yargs(process.argv.slice(2))
+  .usage(`Usage: ${process.argv0} . <command> [options]`)
+  .command('patch', 'Patch HTTP Toolkit using the specified script')
+  .command('restore', 'Restore HTTP Toolkit files to their original state')
+  .command('start', 'Start HTTP Toolkit')
+  .option('path', {
+    type: 'string',
+    describe: 'Path to the HTTP Toolkit installation (the install dir or its resources folder)'
+  })
+  .demandCommand(1, 'You need at least one command before moving on')
+  .alias('h', 'help')
+  .parse()
+
+const isWin = process.platform === 'win32'
+const isMac = process.platform === 'darwin'
+
+const npmCli = [
+  process.env.npm_execpath,
+  path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'), // Windows
+  path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js') // macOS / Linux
+].find(p => p && p.endsWith('npm-cli.js') && fs.existsSync(p))
+
+// Try to find where HTTP Toolkit is installed
+const getAppPath = () => {
+  if (argv.path) {
+    return /resources$/i.test(argv.path) ? argv.path : path.join(argv.path, isMac ? 'Contents/Resources' : 'resources')
+  }
+  const localAppData = process.env.LOCALAPPDATA ?? ''
+  const candidates = isWin
+    ? [
+      path.join(localAppData, 'Programs', 'HTTP Toolkit', 'resources'), // current default
+      path.join(localAppData, 'Programs', 'httptoolkit', 'HTTP Toolkit', 'resources'),
+      path.join(localAppData, 'Programs', 'httptoolkit', 'resources'), // older default
+      path.join(process.env.PROGRAMFILES ?? '', 'HTTP Toolkit', 'resources'),
+      path.join(process.env['PROGRAMFILES(X86)'] ?? '', 'HTTP Toolkit', 'resources')
+    ]
+    : isMac
+      ? ['/Applications/HTTP Toolkit.app/Contents/Resources']
+      : [
+        '/opt/HTTP Toolkit/resources',
+        '/opt/httptoolkit/resources',
+        '/usr/lib/httptoolkit',
+        '/usr/share/httptoolkit/resources'
+      ]
+  for (const p of candidates) {
+    if (p && fs.existsSync(path.join(p, 'app.asar'))) return p
+  }
+  return candidates[0]
+}
+
+const appPath = getAppPath()
+
+const exePath =
+  isWin ? path.join(path.dirname(appPath), 'HTTP Toolkit.exe')
+    : isMac ? path.join(path.dirname(appPath), 'MacOS', 'HTTP Toolkit')
+      : path.join(path.dirname(appPath), 'httptoolkit')
+
+const isSudo = !isWin && (process.getuid || (() => process.env.SUDO_UID ? 0 : null))() === 0
+
+const serverBundlePath = path.join(appPath, 'httptoolkit-server', 'bundle', 'index.js')
+const patcherPort = process.env.PATCHER_PORT || 5067
+
+if (+(process.versions.node.split('.')[0]) < 15) {
+  console.error(chalk.redBright`Node.js version 15 or higher is recommended, you are using version {bold ${process.versions.node}}`)
+}
+
+if (!fs.existsSync(path.join(appPath, 'app.asar'))) {
+  console.error(chalk.redBright`Couldn't find HTTP Toolkit! Make sure it's installed.`)
+  process.exit(1)
+}
+
+console.log(chalk.blueBright`Found HTTP Toolkit at {bold ${path.dirname(appPath)}}`)
+
+// Delete a file or directory tree, ignoring paths that don't exist
+const rm = dirPath => fs.rmSync(dirPath, { recursive: true, force: true })
+
+/** @type {Array<import('child_process').ChildProcess>} */
+const activeProcesses = []
+let isCancelled = false
+
+const cleanUp = async () => {
+  isCancelled = true
+  console.log(chalk.redBright`Cancelled! Cleaning up...`)
+  if (activeProcesses.length) {
+    console.log(chalk.yellowBright`Stopping active processes...`)
+    for (const proc of activeProcesses) {
+      proc.kill('SIGINT')
+      console.log(chalk.yellowBright`Process {bold ${proc.pid ? proc.pid + ' ' : ''}}stopped`)
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
+  const paths = [
+    path.resolve(os.tmpdir(), 'httptoolkit-patch'),
+    path.resolve(appPath, 'app')
+  ]
+  try {
+    for (const p of paths) {
+      if (fs.existsSync(p)) {
+        console.log(chalk.yellowBright`Removing {bold ${p}}`)
+        rm(p)
+      }
+    }
+  } catch (e) {
+    console.error(chalk.redBright`Error while cleaning up`, e)
+  }
+  process.exit(1)
+}
+
+const patchApp = async () => {
+  const filePath = path.join(appPath, 'app.asar')
+  const tempPath = path.join(appPath, 'app')
+
+  if (fs.readFileSync(filePath).includes('Injected by HTTP Toolkit Patcher')) {
+    console.log(chalk.greenBright`App is already patched!`)
+    return
+  }
+
+  const globalProxy = process.env.PROXY
+
+  console.log(chalk.blueBright`Starting the patch process...`)
+
+  if (globalProxy) {
+    if (!globalProxy.match(/^https?:/)) {
+      console.error(chalk.redBright`Global proxy must start with http:// or https://`)
+      process.exit(1)
+    }
+    console.log(chalk.yellowBright`Using custom proxy: {bold ${globalProxy}}`)
+  }
+
+  console.log(chalk.yellowBright`Extracting app files...`)
+
+    ;['SIGINT', 'SIGTERM'].forEach(signal => process.on(signal, cleanUp))
+
+  try {
+    rm(tempPath)
+    asar.extractAll(filePath, tempPath)
+  } catch (e) {
+    if (!isSudo && /** @type {any} */ (e).errno === -13) { // Permission denied
+      console.error(chalk.redBright`Permission denied${!isWin ? ', try running with sudo' : ', try running node as administrator'}`)
+      process.exit(1)
+    }
+    console.error(chalk.redBright`Error extracting app`, e)
+    process.exit(1)
+  }
+
+  const prismaInstrPath = path.join(tempPath, 'node_modules', '@prisma', 'instrumentation')
+  if (fs.existsSync(prismaInstrPath)) {
+    rm(prismaInstrPath)
+    fs.mkdirSync(prismaInstrPath, { recursive: true })
+    fs.writeFileSync(path.join(prismaInstrPath, 'package.json'), JSON.stringify({
+      name: '@prisma/instrumentation',
+      version: '0.0.0-stub',
+      main: 'index.js',
+      type: 'module'
+    }, null, 2))
+    fs.writeFileSync(path.join(prismaInstrPath, 'index.js'),
+      [
+        'export class PrismaInstrumentation {',
+        '  constructor(config) { this._config = config; }',
+        '  instrumentationName = "@prisma/instrumentation";',
+        '  instrumentationVersion = "0.0.0";',
+        '  enable() {}',
+        '  disable() {}',
+        '  setTracerProvider() {}',
+        '  setMeterProvider() {}',
+        '  getConfig() { return this._config || {}; }',
+        '}',
+        'export default PrismaInstrumentation;',
+        ''
+      ].join('\n')
+    )
+    console.log(chalk.yellowBright`Replaced broken @prisma/instrumentation with stub`)
+  }
+
+  const indexPath = path.join(tempPath, 'build', 'index.js')
+  if (!fs.existsSync(indexPath)) {
+    console.error(chalk.redBright`Couldn't find index.js file`)
+    cleanUp()
+  }
+  const data = fs.readFileSync(indexPath, 'utf-8')
+    ;['SIGINT', 'SIGTERM'].forEach(signal => process.off(signal, cleanUp))
+
+  const { email } = await prompts({
+    type: 'text',
+    name: 'email',
+    message: 'Enter an email for the pro plan',
+    validate: value => value.includes('@') || 'Invalid email'
+  })
+
+  if (!email || typeof email !== 'string') {
+    console.error(chalk.redBright`No email provided`)
+    cleanUp()
+  }
+
+  ;['SIGINT', 'SIGTERM'].forEach(signal => process.on(signal, cleanUp))
+  const patchContent = fs.readFileSync('patch.js', 'utf-8')
+
+  const isEsmApp = (() => {
+    try {
+      const { type } = JSON.parse(fs.readFileSync(path.join(tempPath, 'package.json'), 'utf-8'))
+      if (type) return type === 'module'
+    } catch (e) { /* no readable package.json, fall back to sniffing the entry point */ }
+    return /^\s*import .+ from ['"]/m.test(data)
+  })()
+
+  console.log(chalk.yellowBright`Entry point looks like {bold ${isEsmApp ? 'ESM' : 'CommonJS'}}`)
+
+  const patchCode = isEsmApp ? patchContent : patchContent
+    .replace(/\(await import\((['"][^'"]+['"])\)\)\.default/g, 'require($1)')
+    .replace(/\(await import\((['"][^'"]+['"])\)\)/g, 'require($1)')
+
+  // Inject the main patch code where APP_URL is defined
+  const patchedData = data
+    .replace('const APP_URL =', `// ------- Injected by HTTP Toolkit Patcher -------\nconst email = \`${email.replace(/`/g, '\\`')}\`\nconst globalProxy = process.env.PROXY ?? \`${globalProxy ? globalProxy.replace(/`/g, '\\`') : ''}\`\n${patchCode}\n// ------- End patched content -------\nconst APP_URL =`)
+
+  if (data === patchedData || !patchedData) {
+    console.error(chalk.redBright`Patch failed - couldn't find injection point`)
+    cleanUp()
+  }
+
+  fs.writeFileSync(indexPath, patchedData, 'utf-8')
+  console.log(chalk.greenBright`Patched index.js successfully`)
+  console.log(chalk.yellowBright`Installing dependencies...`)
+
+  const deps = ['express', 'https-proxy-agent']
+  try {
+    const proc = npmCli
+      ? spawn(process.execPath, [npmCli, 'install', ...deps], { cwd: tempPath, stdio: 'inherit' })
+      : spawn(`npm install ${deps.join(' ')}`, { cwd: tempPath, stdio: 'inherit', shell: true })
+    activeProcesses.push(proc)
+    const code = await new Promise(resolve => {
+      proc.on('error', () => resolve(null))
+      proc.on('close', resolve)
+    })
+    activeProcesses.splice(activeProcesses.indexOf(proc), 1)
+    if (isCancelled) return
+
+    // Repacking without these ships an app that dies on launch with
+    // ERR_MODULE_NOT_FOUND, so stop here while app.asar is still untouched
+    const missing = deps.filter(d => !fs.existsSync(path.join(tempPath, 'node_modules', d, 'package.json')))
+    if (code !== 0 || missing.length) {
+      console.error(chalk.redBright`Installing dependencies failed (npm exited with ${code}${missing.length ? `, missing ${missing.join(', ')}` : ''}) - HTTP Toolkit was not modified`)
+      if (!npmCli) console.error(chalk.redBright`Couldn't locate npm next to node - if you're using sudo, try {bold sudo env "PATH=$PATH" node . patch}`)
+      return cleanUp()
+    }
+  } catch (e) {
+    console.error(chalk.redBright`Error installing dependencies`, e)
+    cleanUp()
+  }
+
+  rm(path.join(tempPath, 'package-lock.json'))
+  rm(path.join(tempPath, 'yarn.lock'))
+  rm(path.join(tempPath, 'pnpm-lock.yaml'))
+  rm(path.join(tempPath, 'bun.lockb'))
+  fs.copyFileSync(filePath, `${filePath}.bak`)
+  console.log(chalk.greenBright`Created backup at {bold ${filePath}.bak}`)
+
+  console.log(chalk.yellowBright`Repacking the app...`)
+  await asar.createPackage(tempPath, filePath)
+  rm(tempPath)
+  console.log(chalk.greenBright`App patched!`)
+
+  // Patch the node server so the MCP / remote-control bridge works with our UI
+  patchServerBundle()
+
+  rm(path.join(os.tmpdir(), 'httptoolkit-patch'))
+
+  // Disable ASAR integrity checks so Electron doesn't complain
+  await flipElectronFuses()
+}
+
+const patchServerBundle = () => {
+  if (!fs.existsSync(serverBundlePath)) {
+    console.log(chalk.yellowBright`Server bundle not found at ${serverBundlePath}, skipping MCP bridge patch`)
+    return
+  }
+
+  let data = fs.readFileSync(serverBundlePath, 'utf-8')
+
+  if (data.includes(`http://localhost:${patcherPort}`) && data.includes('return!0;') && data.includes('if(!0){e.user=void 0')) {
+    console.log(chalk.greenBright`Server bundle already patched for MCP`)
+    return
+  }
+
+  // Keep an original copy so restore can put it back
+  const bundleBak = `${serverBundlePath}.bak`
+  if (!fs.existsSync(bundleBak)) fs.copyFileSync(serverBundlePath, bundleBak)
+
+  let applied = 0
+
+  // Allow proxy origin
+  const originRegex = /[a-zA-Z0-9_$]+\?\[\/\^https:\\\/\\\/app\\\.httptoolkit\\\.tech\$\/\]:/
+  if (data.includes(`http://localhost:${patcherPort}`)) {
+    applied++
+  } else if (originRegex.test(data)) {
+    data = data.replace(originRegex, match => match.replace('[', `[/^http:\\/\\/localhost:${patcherPort}$/, `))
+    applied++
+  } else {
+    console.error(chalk.yellowBright`Couldn't apply MCP patch 'allow proxy origin' (pattern changed?) - skipping`)
+  }
+
+  // Accept bridge auth
+  const authPattern = 'if(!1===A.jwt){e.user=void 0,r&&this.completeInitialAuth(e)'
+  const authReplacement = 'if(!0){e.user=void 0,r&&this.completeInitialAuth(e)'
+  if (data.includes(authReplacement)) {
+    applied++
+  } else if (data.includes(authPattern)) {
+    data = data.replace(authPattern, authReplacement)
+    applied++
+  } else {
+    console.error(chalk.yellowBright`Couldn't apply MCP patch 'accept bridge auth' (pattern changed?) - skipping`)
+  }
+
+  // Force bridge isPaidUser
+  const isPaidPattern = 'key:"isPaidUser",value:function(){'
+  const isPaidReplacement = 'key:"isPaidUser",value:function(){return!0;'
+  if (data.includes(isPaidReplacement)) {
+    applied++
+  } else if (data.includes(isPaidPattern)) {
+    data = data.replace(isPaidPattern, isPaidReplacement)
+    applied++
+  } else {
+    console.error(chalk.yellowBright`Couldn't apply MCP patch 'force bridge isPaidUser' (pattern changed?) - skipping`)
+  }
+
+  if (applied === 0) {
+    console.error(chalk.yellowBright`No MCP bridge patches applied - remote control may be unavailable`)
+    return
+  }
+
+  fs.writeFileSync(serverBundlePath, data, 'utf-8')
+  console.log(chalk.greenBright`Patched server bundle for MCP (${applied}/3 edits)`)
+}
+
+const restoreServerBundle = () => {
+  const bundleBak = `${serverBundlePath}.bak`
+  if (fs.existsSync(bundleBak)) {
+    fs.copyFileSync(bundleBak, serverBundlePath)
+    fs.rmSync(bundleBak, { force: true })
+    console.log(chalk.greenBright`Restored original server bundle`)
+  }
+}
+
+const flipElectronFuses = async () => {
+  console.log(chalk.yellowBright`Disabling ASAR integrity checks...`)
+
+  if (!fs.existsSync(exePath)) {
+    console.log(chalk.yellowBright`Executable not found at ${exePath}, skipping fuse flipping`)
+    return
+  }
+
+  try {
+    await flipFuses(exePath, {
+      version: FuseVersion.V1,
+      [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: false,
+      [FuseV1Options.OnlyLoadAppFromAsar]: false,
+    })
+    console.log(chalk.greenBright`Integrity checks disabled successfully`)
+  } catch (e) {
+    console.error(chalk.yellowBright`Failed to flip fuses (might already be done or not supported): ${/** @type {Error} */ (e).message}`)
+  }
+}
+
+switch (argv._[0]) {
+  case 'patch':
+    await patchApp()
+    break
+  case 'restore':
+    try {
+      console.log(chalk.blueBright`Restoring app...`)
+      if (!fs.existsSync(path.join(appPath, 'app.asar.bak')))
+        console.error(chalk.redBright`Backup file not found - maybe the app wasn't patched?`)
+      else {
+        fs.copyFileSync(path.join(appPath, 'app.asar.bak'), path.join(appPath, 'app.asar'))
+        console.log(chalk.greenBright`App restored successfully`)
+      }
+      restoreServerBundle()
+      rm(path.join(os.tmpdir(), 'httptoolkit-patch'))
+    } catch (e) {
+      if (!isSudo && /** @type {any} */ (e).errno === -13) { // Permission denied
+        console.error(chalk.redBright`Permission denied${!isWin ? ', try running with sudo' : ', try running node as administrator'}`)
+        process.exit(1)
+      }
+      console.error(chalk.redBright`Error restoring app`, e)
+      process.exit(1)
+    }
+    break
+  case 'start':
+    console.log(chalk.blueBright`Starting HTTP Toolkit...`)
+    try {
+      const command =
+        isWin ? `"${path.resolve(appPath, '..', 'HTTP Toolkit.exe')}"`
+          : isMac ? 'open -a "HTTP Toolkit"'
+            : 'httptoolkit'
+      const proc = spawn(command, { stdio: 'inherit', shell: true })
+      proc.on('close', code => process.exit(code))
+    } catch (e) {
+      console.error(chalk.redBright`Error starting app`, e)
+      if (isSudo) console.error(chalk.redBright`Try running without sudo`)
+      process.exit(1)
+    }
+    break
+  default:
+    console.error(chalk.redBright`Unknown command`)
+    process.exit(1)
+}
+
+if (!isCancelled) console.log(chalk.greenBright`All done!`)
